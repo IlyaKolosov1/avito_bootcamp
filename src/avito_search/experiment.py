@@ -16,9 +16,13 @@ from avito_search.data import load_dataset
 from avito_search.fusion import reciprocal_rank_fusion
 from avito_search.geography import merge_local_and_global
 from avito_search.metrics import recall_at_k, recall_by_query
+from avito_search.ranker import build_pair_features, fit_ranker, rerank_candidates
 from avito_search.submission import build_submission, write_submission
 from avito_search.tfidf import TfidfConfig, TfidfRetriever
-from avito_search.validation import build_proxy_validation
+from avito_search.validation import (
+    build_proxy_validation,
+    build_ranker_training_data,
+)
 
 
 @dataclass(frozen=True)
@@ -46,6 +50,7 @@ class ComparisonArtifacts:
 @dataclass(frozen=True)
 class RetrievalResult:
     candidates: pl.DataFrame
+    components: dict[str, pl.DataFrame]
     vocabulary_sizes: dict[str, int]
 
 
@@ -107,13 +112,36 @@ def _retrieval_columns(
     if config["geography"]["enabled"]:
         item_columns.append("item_location_id")
         query_columns.append("search_location_id")
+    if config.get("ranker", {}).get("enabled", False):
+        item_columns.extend(
+            [
+                "item_category_id",
+                "item_price",
+                "item_rating",
+                "item_rating_reviews_count",
+                "item_is_phone_hidden",
+                "item_is_message_forbidden",
+            ]
+        )
+        query_columns.extend(["search_is_delivery_search", "search_category"])
+    item_columns = list(dict.fromkeys(item_columns))
+    query_columns = list(dict.fromkeys(query_columns))
     return item_columns, query_columns
+
+
+def _fit_retrievers(
+    retriever_configs: list[tuple[str, TfidfConfig]],
+    items: pl.DataFrame,
+) -> list[tuple[str, TfidfRetriever]]:
+    return [
+        (source, TfidfRetriever(tfidf_config, source=source).fit(items))
+        for source, tfidf_config in retriever_configs
+    ]
 
 
 def _retrieve_candidates(
     config: dict[str, Any],
-    retriever_configs: list[tuple[str, TfidfConfig]],
-    items: pl.DataFrame,
+    retrievers: list[tuple[str, TfidfRetriever]],
     queries: pl.DataFrame,
 ) -> RetrievalResult:
     geography = config["geography"]
@@ -121,23 +149,23 @@ def _retrieve_candidates(
         geography["local_candidates"] + geography["global_candidates"]
     )
     fusion = config.get("fusion", {})
-    use_fusion = len(retriever_configs) > 1
+    use_fusion = len(retrievers) > 1
     candidate_pool_size = fusion.get("candidate_pool_size", total_candidates)
     if candidate_pool_size < total_candidates:
         raise ValueError(
             "fusion.candidate_pool_size must be at least total candidates"
         )
 
-    retrievers = [
-        (source, TfidfRetriever(tfidf_config, source=source).fit(items))
-        for source, tfidf_config in retriever_configs
-    ]
     query_ids = queries.get_column("query_id").to_list()
     retrieval_limit = candidate_pool_size if use_fusion else total_candidates
     global_tables = [
         retriever.retrieve(queries, top_k=retrieval_limit)
         for _, retriever in retrievers
     ]
+    components = {
+        source: table
+        for (source, _), table in zip(retrievers, global_tables, strict=True)
+    }
     global_candidates = global_tables[0]
     if use_fusion:
         global_candidates = reciprocal_rank_fusion(
@@ -158,6 +186,12 @@ def _retrieve_candidates(
             retriever.retrieve_local(queries, top_k=local_limit)
             for _, retriever in retrievers
         ]
+        components.update(
+            {
+                f"{source}_local": table
+                for (source, _), table in zip(retrievers, local_tables, strict=True)
+            }
+        )
         local_candidates = local_tables[0]
         if use_fusion:
             local_candidates = reciprocal_rank_fusion(
@@ -177,6 +211,7 @@ def _retrieve_candidates(
 
     return RetrievalResult(
         candidates=candidates,
+        components=components,
         vocabulary_sizes={
             source: len(retriever.vectorizer.vocabulary_)
             for source, retriever in retrievers
@@ -208,14 +243,55 @@ def run_experiment(
     queries = query_source.collect()
 
     started_at = time.perf_counter()
+    retrievers = _fit_retrievers(retriever_configs, items)
     retrieval = _retrieve_candidates(
         config,
-        retriever_configs,
-        items,
+        retrievers,
         queries,
     )
+    ranker_result = None
+    if config.get("ranker", {}).get("enabled", False):
+        ranker_config = config["ranker"]
+        training_data = build_ranker_training_data(
+            tables.train,
+            tables.benchmark_items,
+            seed=config["seed"],
+            max_queries=ranker_config.get("max_train_queries", 4000),
+        )
+        training_queries = training_data.queries.select(query_columns)
+        training_retrieval = _retrieve_candidates(
+            config,
+            retrievers,
+            training_queries,
+        )
+        missing_rank = config["fusion"]["candidate_pool_size"] + 1
+        training_features = build_pair_features(
+            training_retrieval.candidates,
+            training_retrieval.components,
+            training_queries,
+            items,
+            missing_rank=missing_rank,
+        )
+        target_features = build_pair_features(
+            retrieval.candidates,
+            retrieval.components,
+            queries,
+            items,
+            missing_rank=missing_rank,
+        )
+        ranker_result = fit_ranker(
+            training_features,
+            training_data.labels,
+            ranker_config,
+        )
+        candidates = rerank_candidates(
+            ranker_result.model,
+            target_features,
+            top_k=50,
+        )
+    else:
+        candidates = retrieval.candidates
     runtime_seconds = time.perf_counter() - started_at
-    candidates = retrieval.candidates
     submission = build_submission(queries, candidates, top_k=50)
 
     run_directory = Path(output_dir) / config["name"]
@@ -227,13 +303,15 @@ def run_experiment(
     candidates.write_parquet(predictions_path)
     write_submission(submission, submission_path)
     shutil.copyfile(config_path, run_directory / "config.toml")
+    if ranker_result is not None:
+        ranker_result.model.save_model(run_directory / "model.cbm")
 
     metadata = {
         "experiment": config["name"],
         "run_type": "submission",
         "query_count": queries.height,
         "item_count": items.height,
-        "candidates_per_query": (
+        "candidates_per_query": 50 if ranker_result is not None else (
             config["geography"]["local_candidates"]
             + config["geography"]["global_candidates"]
         ),
@@ -243,6 +321,10 @@ def run_experiment(
         "tfidf": asdict(retriever_configs[0][1]),
         "char_tfidf": config.get("char_tfidf"),
         "fusion": config.get("fusion"),
+        "ranker": config.get("ranker"),
+        "ranker_statistics": (
+            ranker_result.statistics if ranker_result is not None else None
+        ),
         "geography": config["geography"],
         "metrics_available": False,
     }
@@ -288,14 +370,55 @@ def evaluate_experiment(
     queries = validation.queries.select(query_columns)
 
     started_at = time.perf_counter()
+    retrievers = _fit_retrievers(retriever_configs, items)
     retrieval = _retrieve_candidates(
         config,
-        retriever_configs,
-        items,
+        retrievers,
         queries,
     )
+    ranker_result = None
+    if config.get("ranker", {}).get("enabled", False):
+        ranker_config = config["ranker"]
+        training_data = build_ranker_training_data(
+            validation.train_fold,
+            tables.benchmark_items,
+            seed=config["seed"],
+            max_queries=ranker_config.get("max_train_queries", 4000),
+        )
+        training_queries = training_data.queries.select(query_columns)
+        training_retrieval = _retrieve_candidates(
+            config,
+            retrievers,
+            training_queries,
+        )
+        missing_rank = config["fusion"]["candidate_pool_size"] + 1
+        training_features = build_pair_features(
+            training_retrieval.candidates,
+            training_retrieval.components,
+            training_queries,
+            items,
+            missing_rank=missing_rank,
+        )
+        validation_features = build_pair_features(
+            retrieval.candidates,
+            retrieval.components,
+            queries,
+            items,
+            missing_rank=missing_rank,
+        )
+        ranker_result = fit_ranker(
+            training_features,
+            training_data.labels,
+            ranker_config,
+        )
+        candidates = rerank_candidates(
+            ranker_result.model,
+            validation_features,
+            top_k=50,
+        )
+    else:
+        candidates = retrieval.candidates
     runtime_seconds = time.perf_counter() - started_at
-    candidates = retrieval.candidates
 
     recalls = {
         f"recall_at_{k}": recall_at_k(validation.labels, candidates, k=k)
@@ -320,6 +443,8 @@ def evaluate_experiment(
     candidates.write_parquet(predictions_path)
     per_query_metrics.write_parquet(per_query_metrics_path)
     shutil.copyfile(config_path, run_directory / "config.toml")
+    if ranker_result is not None:
+        ranker_result.model.save_model(run_directory / "model.cbm")
 
     metrics = {
         "experiment": config["name"],
@@ -334,6 +459,10 @@ def evaluate_experiment(
         "tfidf": asdict(retriever_configs[0][1]),
         "char_tfidf": config.get("char_tfidf"),
         "fusion": config.get("fusion"),
+        "ranker": config.get("ranker"),
+        "ranker_statistics": (
+            ranker_result.statistics if ranker_result is not None else None
+        ),
         "geography": config["geography"],
         "proxy_validation": validation.statistics,
     }

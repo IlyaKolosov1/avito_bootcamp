@@ -75,6 +75,21 @@ uv run avito-experiment evaluate --config configs/b2_tfidf_hybrid.toml
 uv run avito-experiment run --config configs/b2_tfidf_hybrid.toml
 ```
 
+## B3: CatBoost learning-to-rank
+
+B3 расширяет retrieval-пул до 200 кандидатов, а затем выбирает лучшие 50 с
+помощью `CatBoostRanker`. Модель обучается на query-группах из train и hard
+negatives из текущего retrieval. Признаки включают word/char score и rank,
+RRF, совпадение географии и категории, а также свойства объявления.
+
+```bash
+uv run avito-experiment evaluate --config configs/b3_catboost_ranker.toml
+uv run avito-experiment run --config configs/b3_catboost_ranker.toml
+```
+
+Для запуска на CUDA-машине можно заменить `task_type = "CPU"` на `"GPU"` в
+конфигурации эксперимента.
+
 ## Ablation: вклад параметров и географии
 
 Две промежуточные конфигурации меняют относительно B0 только один компонент:
@@ -98,6 +113,7 @@ uv run avito-experiment evaluate --config configs/a2_tfidf_geo.toml
 | A2: только география | 0.3810 | 0.4590 | 0.5293 |
 | B1: TF-IDF с параметрами и географией | 0.4419 | 0.5425 | 0.6457 |
 | B2: word + char TF-IDF с географией | 0.4941 | 0.6031 | **0.7155** |
+| B3: CatBoost reranker над pool-200 | **0.5338** | **0.6408** | **0.7501** |
 
 Это сравнительная локальная оценка, а не прогноз leaderboard: только 6.29%
 положительных пар validation-fold относятся к объявлениям, присутствующим в
@@ -111,3 +127,8 @@ uv run avito-experiment evaluate --config configs/a2_tfidf_geo.toml
 Символьный TF-IDF добавляет ещё 0.0698 Recall@50 относительно B1. Улучшение
 получено без нейросетевых эмбеддингов: за счёт устойчивого текстового поиска,
 географического ограничения и объединения независимых ранжирований.
+
+CatBoost-reranker добавляет ещё 0.0346 Recall@50 относительно B2. Расширение
+пула само по себе даёт 0.7267, а обучаемый отбор повышает результат до 0.7501.
+Таким образом, прирост связан и с большим покрытием кандидатов, и с
+learning-to-rank поверх hard negatives.

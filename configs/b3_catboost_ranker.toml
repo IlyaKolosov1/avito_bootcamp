@@ -1,0 +1,51 @@
+name = "b3_catboost_ranker"
+seed = 42
+
+[data]
+directory = "dataset"
+
+[validation]
+fold_count = 5
+fold_index = 0
+max_queries = 2452
+
+[tfidf]
+item_fields = [
+    "item_title_raw",
+    "item_infm_params_text",
+]
+query_fields = [
+    "search_query",
+    "search_infm_params_text",
+]
+ngram_range = [1, 2]
+min_df = 2
+
+[char_tfidf]
+enabled = true
+item_fields = ["item_title_raw"]
+query_fields = ["search_query"]
+analyzer = "char_wb"
+ngram_range = [3, 5]
+min_df = 3
+max_features = 300000
+
+[fusion]
+candidate_pool_size = 300
+rrf_k = 60
+
+[geography]
+enabled = true
+local_candidates = 160
+global_candidates = 40
+
+[ranker]
+enabled = true
+max_train_queries = 4000
+iterations = 250
+depth = 8
+learning_rate = 0.08
+loss_function = "YetiRankPairwise"
+random_seed = 42
+task_type = "CPU"
+verbose = 50

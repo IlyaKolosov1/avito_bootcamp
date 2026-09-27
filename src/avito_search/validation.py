@@ -24,6 +24,12 @@ class ProxyValidationData:
     statistics: dict[str, int | float]
 
 
+@dataclass(frozen=True)
+class RankerTrainingData:
+    queries: pl.DataFrame
+    labels: pl.DataFrame
+
+
 def normalized_query(column: str = "search_query") -> pl.Expr:
     """Normalize casing and whitespace without language-specific assumptions."""
     return (
@@ -149,3 +155,56 @@ def build_proxy_validation(
         labels=labels,
         statistics=statistics,
     )
+
+
+def build_ranker_training_data(
+    train: pl.LazyFrame,
+    benchmark_items: pl.LazyFrame,
+    *,
+    seed: int = 42,
+    max_queries: int = 4000,
+) -> RankerTrainingData:
+    """Build deterministic train query groups with reachable positive items."""
+    if max_queries <= 0:
+        raise ValueError("max_queries must be positive")
+
+    rows = train.with_columns(
+        normalized_query().alias("query_norm"),
+        normalized_query("search_infm_params_text").alias("filter_norm"),
+    ).with_columns(
+        pl.concat_str(
+            [
+                pl.col("query_norm"),
+                pl.col("search_location_id").cast(pl.String),
+                pl.col("search_is_delivery_search").cast(pl.String),
+                pl.col("filter_norm"),
+                pl.col("search_category").cast(pl.String),
+            ],
+            separator="|",
+        )
+        .hash(seed=seed)
+        .cast(pl.String)
+        .alias("query_id")
+    )
+    reachable = rows.join(
+        benchmark_items.select("item_id").unique(),
+        on="item_id",
+        how="inner",
+    )
+    query_table = reachable.group_by("query_id").agg(
+        [pl.col(column).first().alias(column) for column in QUERY_CONTEXT_COLUMNS]
+    )
+    queries = (
+        query_table.collect()
+        .with_columns(pl.col("query_id").hash(seed=seed).alias("_sample_order"))
+        .sort("_sample_order")
+        .head(max_queries)
+        .drop("_sample_order")
+    )
+    labels = (
+        reachable.select("query_id", "item_id")
+        .unique()
+        .join(queries.lazy().select("query_id"), on="query_id", how="inner")
+        .collect()
+    )
+    return RankerTrainingData(queries=queries, labels=labels)
