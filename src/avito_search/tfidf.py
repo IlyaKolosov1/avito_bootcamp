@@ -58,6 +58,8 @@ class TfidfRetriever:
         self.index: NearestNeighbors | None = None
         self.item_matrix: csr_matrix | None = None
         self.item_ids: np.ndarray | None = None
+        self.item_locations: np.ndarray | None = None
+        self.location_indices: dict[object, np.ndarray] = {}
 
     def fit(self, items: pl.DataFrame) -> "TfidfRetriever":
         """Build the vocabulary and exact nearest-neighbour index."""
@@ -69,6 +71,12 @@ class TfidfRetriever:
 
         self.item_ids = items.get_column("item_id").to_numpy()
         self.item_matrix = item_matrix
+        if "item_location_id" in items.columns:
+            self.item_locations = items.get_column("item_location_id").to_numpy()
+            self.location_indices = {
+                location: np.flatnonzero(self.item_locations == location)
+                for location in np.unique(self.item_locations)
+            }
         self.index = NearestNeighbors(
             metric="cosine",
             algorithm="brute",
@@ -126,6 +134,80 @@ class TfidfRetriever:
                             "source": "word_tfidf",
                         }
                     )
+
+        return pl.DataFrame(
+            candidate_rows,
+            schema={
+                "query_id": pl.String,
+                "item_id": pl.String,
+                "score": pl.Float64,
+                "rank": pl.Int64,
+                "source": pl.String,
+            },
+        )
+
+    def retrieve_local(
+        self,
+        queries: pl.DataFrame,
+        *,
+        query_id_column: str = "query_id",
+        query_location_column: str = "search_location_id",
+        top_k: int = 40,
+    ) -> pl.DataFrame:
+        """Retrieve positive-score candidates from the exact query location."""
+        if self.item_matrix is None or self.item_ids is None:
+            raise RuntimeError("Call fit() before retrieve_local()")
+        if self.item_locations is None:
+            raise ValueError("Items must include item_location_id for local retrieval")
+        if top_k <= 0:
+            raise ValueError("top_k must be positive")
+
+        required_columns = {query_id_column, query_location_column}
+        missing = required_columns - set(queries.columns)
+        if missing:
+            raise ValueError(f"Missing query columns: {sorted(missing)}")
+
+        query_texts = combine_text(queries, self.config.query_fields)
+        query_matrix = self.vectorizer.transform(query_texts).tocsr()
+        query_ids = queries.get_column(query_id_column).to_list()
+        query_locations = queries.get_column(query_location_column).to_list()
+
+        candidate_rows: list[dict[str, object]] = []
+        for row_index, (query_id, location) in enumerate(
+            zip(query_ids, query_locations, strict=True)
+        ):
+            item_indices = self.location_indices.get(location)
+            if item_indices is None or len(item_indices) == 0:
+                continue
+
+            scores = (
+                query_matrix[row_index]
+                @ self.item_matrix[item_indices].transpose()
+            ).toarray().ravel()
+            positive_positions = np.flatnonzero(scores > 0)
+            if len(positive_positions) == 0:
+                continue
+
+            positive_item_ids = self.item_ids[item_indices[positive_positions]].astype(str)
+            order = np.lexsort(
+                (
+                    positive_item_ids,
+                    -scores[positive_positions],
+                )
+            )[:top_k]
+
+            for rank, ordered_position in enumerate(order, start=1):
+                local_position = positive_positions[ordered_position]
+                item_index = item_indices[local_position]
+                candidate_rows.append(
+                    {
+                        "query_id": query_id,
+                        "item_id": str(self.item_ids[item_index]),
+                        "score": float(scores[local_position]),
+                        "rank": rank,
+                        "source": "word_tfidf_local",
+                    }
+                )
 
         return pl.DataFrame(
             candidate_rows,

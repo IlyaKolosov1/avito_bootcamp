@@ -13,6 +13,7 @@ from typing import Any
 import polars as pl
 
 from avito_search.data import load_dataset
+from avito_search.geography import merge_local_and_global
 from avito_search.metrics import recall_at_k, recall_by_query
 from avito_search.submission import build_submission, write_submission
 from avito_search.tfidf import TfidfConfig, TfidfRetriever
@@ -35,6 +36,12 @@ class EvaluationArtifacts:
     metrics_path: Path
 
 
+@dataclass(frozen=True)
+class ComparisonArtifacts:
+    summary: pl.DataFrame
+    summary_path: Path
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
     """Read one immutable experiment configuration."""
     with Path(path).open("rb") as config_file:
@@ -48,6 +55,57 @@ def load_config(path: str | Path) -> dict[str, Any]:
     return config
 
 
+def _build_tfidf_config(config: dict[str, Any]) -> TfidfConfig:
+    return TfidfConfig(
+        item_fields=tuple(config["tfidf"]["item_fields"]),
+        query_fields=tuple(config["tfidf"]["query_fields"]),
+        ngram_range=tuple(config["tfidf"]["ngram_range"]),
+        min_df=config["tfidf"]["min_df"],
+    )
+
+
+def _retrieval_columns(
+    config: dict[str, Any],
+    tfidf_config: TfidfConfig,
+) -> tuple[list[str], list[str]]:
+    item_columns = list(dict.fromkeys(["item_id", *tfidf_config.item_fields]))
+    query_columns = list(dict.fromkeys(["query_id", *tfidf_config.query_fields]))
+    if config["geography"]["enabled"]:
+        item_columns.append("item_location_id")
+        query_columns.append("search_location_id")
+    return item_columns, query_columns
+
+
+def _retrieve_candidates(
+    config: dict[str, Any],
+    tfidf_config: TfidfConfig,
+    items: pl.DataFrame,
+    queries: pl.DataFrame,
+) -> tuple[TfidfRetriever, pl.DataFrame]:
+    geography = config["geography"]
+    total_candidates = (
+        geography["local_candidates"] + geography["global_candidates"]
+    )
+    retriever = TfidfRetriever(tfidf_config).fit(items)
+
+    if not geography["enabled"]:
+        return retriever, retriever.retrieve(queries, top_k=total_candidates)
+
+    global_candidates = retriever.retrieve(queries, top_k=total_candidates)
+    local_candidates = retriever.retrieve_local(
+        queries,
+        top_k=geography["local_candidates"],
+    )
+    candidates = merge_local_and_global(
+        queries.get_column("query_id").to_list(),
+        local_candidates,
+        global_candidates,
+        local_limit=geography["local_candidates"],
+        total_limit=total_candidates,
+    )
+    return retriever, candidates
+
+
 def run_experiment(
     config_path: str | Path,
     *,
@@ -57,23 +115,13 @@ def run_experiment(
     """Run the configured benchmark retrieval and save reproducible artifacts."""
     config_path = Path(config_path)
     config = load_config(config_path)
-    if config["geography"]["enabled"]:
-        raise NotImplementedError(
-            "Geographical retrieval belongs to B1 and is not implemented yet"
-        )
     if query_limit is not None and query_limit <= 0:
         raise ValueError("query_limit must be positive")
 
-    tfidf_config = TfidfConfig(
-        item_fields=tuple(config["tfidf"]["item_fields"]),
-        query_fields=tuple(config["tfidf"]["query_fields"]),
-        ngram_range=tuple(config["tfidf"]["ngram_range"]),
-        min_df=config["tfidf"]["min_df"],
-    )
+    tfidf_config = _build_tfidf_config(config)
 
     tables = load_dataset(config["data"]["directory"])
-    item_columns = list(dict.fromkeys(["item_id", *tfidf_config.item_fields]))
-    query_columns = list(dict.fromkeys(["query_id", *tfidf_config.query_fields]))
+    item_columns, query_columns = _retrieval_columns(config, tfidf_config)
 
     items = tables.benchmark_items.select(item_columns).collect()
     query_source = tables.benchmark_queries.select(query_columns)
@@ -82,10 +130,11 @@ def run_experiment(
     queries = query_source.collect()
 
     started_at = time.perf_counter()
-    retriever = TfidfRetriever(tfidf_config).fit(items)
-    candidates = retriever.retrieve(
+    retriever, candidates = _retrieve_candidates(
+        config,
+        tfidf_config,
+        items,
         queries,
-        top_k=config["geography"]["global_candidates"],
     )
     runtime_seconds = time.perf_counter() - started_at
     submission = build_submission(queries, candidates, top_k=50)
@@ -105,10 +154,14 @@ def run_experiment(
         "run_type": "submission",
         "query_count": queries.height,
         "item_count": items.height,
-        "candidates_per_query": config["geography"]["global_candidates"],
+        "candidates_per_query": (
+            config["geography"]["local_candidates"]
+            + config["geography"]["global_candidates"]
+        ),
         "runtime_seconds": round(runtime_seconds, 3),
         "vocabulary_size": len(retriever.vectorizer.vocabulary_),
         "tfidf": asdict(tfidf_config),
+        "geography": config["geography"],
         "metrics_available": False,
     }
     metadata_path.write_text(
@@ -133,19 +186,10 @@ def evaluate_experiment(
     """Evaluate one experiment on the deterministic proxy-validation set."""
     config_path = Path(config_path)
     config = load_config(config_path)
-    if config["geography"]["enabled"]:
-        raise NotImplementedError(
-            "Geographical retrieval belongs to B1 and is not implemented yet"
-        )
 
     validation_config = config["validation"]
     max_queries = query_limit or validation_config.get("max_queries")
-    tfidf_config = TfidfConfig(
-        item_fields=tuple(config["tfidf"]["item_fields"]),
-        query_fields=tuple(config["tfidf"]["query_fields"]),
-        ngram_range=tuple(config["tfidf"]["ngram_range"]),
-        min_df=config["tfidf"]["min_df"],
-    )
+    tfidf_config = _build_tfidf_config(config)
 
     tables = load_dataset(config["data"]["directory"])
     validation = build_proxy_validation(
@@ -157,14 +201,17 @@ def evaluate_experiment(
         max_queries=max_queries,
     )
 
-    item_columns = list(dict.fromkeys(["item_id", *tfidf_config.item_fields]))
-    query_columns = list(dict.fromkeys(["query_id", *tfidf_config.query_fields]))
+    item_columns, query_columns = _retrieval_columns(config, tfidf_config)
     items = tables.benchmark_items.select(item_columns).collect()
     queries = validation.queries.select(query_columns)
 
     started_at = time.perf_counter()
-    retriever = TfidfRetriever(tfidf_config).fit(items)
-    candidates = retriever.retrieve(queries, top_k=50)
+    retriever, candidates = _retrieve_candidates(
+        config,
+        tfidf_config,
+        items,
+        queries,
+    )
     runtime_seconds = time.perf_counter() - started_at
 
     recalls = {
@@ -200,6 +247,8 @@ def evaluate_experiment(
         **recalls,
         "runtime_seconds": round(runtime_seconds, 3),
         "vocabulary_size": len(retriever.vectorizer.vocabulary_),
+        "tfidf": asdict(tfidf_config),
+        "geography": config["geography"],
         "proxy_validation": validation.statistics,
     }
     metrics_path.write_text(
@@ -213,3 +262,33 @@ def evaluate_experiment(
         per_query_metrics_path=per_query_metrics_path,
         metrics_path=metrics_path,
     )
+
+
+def compare_evaluations(
+    output_dir: str | Path = "runs",
+) -> ComparisonArtifacts:
+    """Collect validation metrics into one compact comparison table."""
+    output_dir = Path(output_dir)
+    rows = []
+    for metrics_path in sorted(output_dir.glob("*_validation/metrics.json")):
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        rows.append(
+            {
+                "experiment": metrics["experiment"],
+                "query_count": metrics["query_count"],
+                "recall_at_10": metrics["recall_at_10"],
+                "recall_at_20": metrics["recall_at_20"],
+                "recall_at_50": metrics["recall_at_50"],
+                "runtime_seconds": metrics["runtime_seconds"],
+            }
+        )
+
+    if not rows:
+        raise FileNotFoundError(
+            f"No validation metrics found in {output_dir.resolve()}"
+        )
+
+    summary = pl.DataFrame(rows).sort("recall_at_50", descending=True)
+    summary_path = output_dir / "validation_summary.csv"
+    summary.write_csv(summary_path)
+    return ComparisonArtifacts(summary=summary, summary_path=summary_path)

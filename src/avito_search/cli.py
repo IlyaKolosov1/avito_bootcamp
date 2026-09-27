@@ -5,7 +5,11 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 
-from avito_search.experiment import evaluate_experiment, run_experiment
+from avito_search.experiment import (
+    compare_evaluations,
+    evaluate_experiment,
+    run_experiment,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -42,6 +46,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override validation query count for a smoke test",
     )
+
+    compare_parser = subparsers.add_parser(
+        "compare",
+        help="compare all completed validation runs",
+    )
+    compare_parser.add_argument(
+        "--output-dir",
+        default="runs",
+        help="directory containing validation runs",
+    )
     return parser
 
 
@@ -63,3 +77,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         print(f"Run directory: {artifacts.run_directory}")
         print(f"Metrics: {artifacts.metrics_path}")
+    elif args.command == "compare":
+        artifacts = compare_evaluations(args.output_dir)
+        print(artifacts.summary)
+        print(f"Summary: {artifacts.summary_path}")
