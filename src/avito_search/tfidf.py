@@ -1,4 +1,4 @@
-"""Word TF-IDF candidate generation."""
+"""Sparse TF-IDF candidate generation."""
 
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ class TfidfConfig:
     ngram_range: tuple[int, int] = (1, 2)
     min_df: int = 2
     max_df: float = 0.995
+    analyzer: str = "word"
+    max_features: int | None = None
 
 
 def combine_text(frame: pl.DataFrame, fields: tuple[str, ...]) -> list[str]:
@@ -42,15 +44,18 @@ def combine_text(frame: pl.DataFrame, fields: tuple[str, ...]) -> list[str]:
 
 
 class TfidfRetriever:
-    """Exact cosine retrieval over a sparse word TF-IDF matrix."""
+    """Exact cosine retrieval over a sparse TF-IDF matrix."""
 
-    def __init__(self, config: TfidfConfig) -> None:
+    def __init__(self, config: TfidfConfig, *, source: str = "word_tfidf") -> None:
         self.config = config
+        self.source = source
         self.vectorizer = TfidfVectorizer(
             lowercase=True,
+            analyzer=config.analyzer,
             ngram_range=config.ngram_range,
             min_df=config.min_df,
             max_df=config.max_df,
+            max_features=config.max_features,
             sublinear_tf=True,
             norm="l2",
             dtype=np.float32,
@@ -131,7 +136,7 @@ class TfidfRetriever:
                             "item_id": str(self.item_ids[item_index]),
                             "score": float(score),
                             "rank": rank,
-                            "source": "word_tfidf",
+                            "source": self.source,
                         }
                     )
 
@@ -205,7 +210,7 @@ class TfidfRetriever:
                         "item_id": str(self.item_ids[item_index]),
                         "score": float(scores[local_position]),
                         "rank": rank,
-                        "source": "word_tfidf_local",
+                        "source": f"{self.source}_local",
                     }
                 )
 
