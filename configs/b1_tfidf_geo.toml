@@ -1,0 +1,27 @@
+name = "b1_tfidf_geo"
+seed = 42
+
+[data]
+directory = "dataset"
+
+[validation]
+fold_count = 5
+fold_index = 0
+max_queries = 2452
+
+[tfidf]
+item_fields = [
+    "item_title_raw",
+    "item_infm_params_text",
+]
+query_fields = [
+    "search_query",
+    "search_infm_params_text",
+]
+ngram_range = [1, 2]
+min_df = 2
+
+[geography]
+enabled = true
+local_candidates = 40
+global_candidates = 10

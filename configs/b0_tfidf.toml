@@ -1,0 +1,21 @@
+name = "b0_tfidf"
+seed = 42
+
+[data]
+directory = "dataset"
+
+[validation]
+fold_count = 5
+fold_index = 0
+max_queries = 2452
+
+[tfidf]
+item_fields = ["item_title_raw"]
+query_fields = ["search_query"]
+ngram_range = [1, 2]
+min_df = 2
+
+[geography]
+enabled = false
+local_candidates = 0
+global_candidates = 50
